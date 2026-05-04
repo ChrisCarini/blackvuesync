@@ -786,6 +786,15 @@ def get_dashcam_filenames(base_url: str) -> list[str]:
 
         return get_filenames(file_lines)
     except urllib.error.URLError as e:
+        print(f'reason: {e.reason} ; errno: {e.reason.errno} ; ')
+        print(isinstance(e.reason, OSError))
+        print(isinstance(e.reason, TimeoutError))
+        print(isinstance(e.reason, socket.timeout))
+        print(e.reason.errno in dashcam_unavailable_errno_codes)
+        print(e)
+        print(type(e))
+        print(e.reason)
+        print(type(e.reason))
         if isinstance(e.reason, OSError) and (
             isinstance(e.reason, (TimeoutError, socket.timeout))
             or e.reason.errno in dashcam_unavailable_errno_codes
@@ -977,14 +986,20 @@ def download_file(
     remove_download_failed_marker(destination, group_name, filename)
 
     temp_filepath = os.path.join(destination, f".{filename}")
-    if os.path.exists(temp_filepath):
+
+    # checks for an existing partial download to attempt resume
+    temp_size = os.path.getsize(temp_filepath) if os.path.exists(temp_filepath) else 0
+
+    if temp_size > 0:
         logger.debug(
-            "Found incomplete download : %s",
+            "Found incomplete download : %s (%d bytes)",
             temp_filepath,
+            temp_size,
             extra={
                 "event": "incomplete_download_found",
                 "recording_filename": filename,
                 "temp_path": temp_filepath,
+                "temp_size_bytes": temp_size,
             },
         )
 
@@ -998,15 +1013,63 @@ def download_file(
             if affinity_key:
                 request.add_header("X-Affinity-Key", affinity_key)
 
-            # downloads file
-            with urllib.request.urlopen(request) as response:
-                headers = response.info()
-                size = headers.get("Content-Length")
+            # requests only the remaining bytes when resuming a partial download
+            if temp_size > 0:
+                request.add_header("Range", f"bytes={temp_size}-")
 
-                # writes response to temp file
-                with open(temp_filepath, "wb") as f:
-                    while chunk := response.read(DOWNLOAD_CHUNK_SIZE):
-                        f.write(chunk)
+            # downloads file
+            try:
+                with urllib.request.urlopen(request) as response:
+                    status = response.getcode()
+                    headers = response.info()
+                    transfer_size = headers.get("Content-Length")
+
+                    # 206 = server honored Range, append; 200 = full body, overwrite
+                    if status == 206 and temp_size > 0:
+                        file_mode = "ab"
+                        logger.debug(
+                            "Resuming download : %s from byte %d",
+                            filename,
+                            temp_size,
+                            extra={
+                                "event": "file_download_resumed",
+                                "recording_filename": filename,
+                                "resume_offset_bytes": temp_size,
+                            },
+                        )
+                    else:
+                        file_mode = "wb"
+
+                    # writes response to temp file
+                    with open(temp_filepath, file_mode) as f:
+                        while chunk := response.read(DOWNLOAD_CHUNK_SIZE):
+                            f.write(chunk)
+            except urllib.error.HTTPError as e:
+                if e.code == 416 and temp_size > 0:
+                    # 416 Range Not Satisfiable: temp file is corrupt or already
+                    # complete; discards it and retries without Range
+                    logger.debug(
+                        "Range not satisfiable for : %s; discarding partial"
+                        " download and retrying",
+                        filename,
+                        extra={
+                            "event": "range_not_satisfiable",
+                            "recording_filename": filename,
+                            "temp_size_bytes": temp_size,
+                        },
+                    )
+                    os.remove(temp_filepath)
+                    request = urllib.request.Request(url)
+                    if affinity_key:
+                        request.add_header("X-Affinity-Key", affinity_key)
+                    with urllib.request.urlopen(request) as response:
+                        headers = response.info()
+                        transfer_size = headers.get("Content-Length")
+                        with open(temp_filepath, "wb") as f:
+                            while chunk := response.read(DOWNLOAD_CHUNK_SIZE):
+                                f.write(chunk)
+                else:
+                    raise
         finally:
             end = time.perf_counter()
             elapsed_s = end - start
@@ -1014,7 +1077,9 @@ def download_file(
         os.rename(temp_filepath, destination_filepath)
 
         content_length_bytes = int(size) if size else None
-        speed_bps = int(10.0 * float(size) / elapsed_s) if size else None
+        speed_bps = (
+            int(10.0 * float(transfer_size) / elapsed_s) if transfer_size else None
+        )
         speed_str = format_natural_speed(speed_bps)
         logger.debug(
             "Downloaded file : %s%s",
@@ -1472,16 +1537,8 @@ TEMP_FILENAME_GLOB = ".[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][
 
 def clean_destination(destination: str, grouping: str) -> None:
     """removes temporary artifacts from the destination directory"""
-    # removes temporary files from interrupted downloads
-    temp_filepath_glob = os.path.join(destination, TEMP_FILENAME_GLOB)
-    temp_filepaths = glob.glob(temp_filepath_glob)
-
-    for temp_filepath in temp_filepaths:
-        if not dry_run:
-            logger.debug("Removing temporary file : %s", temp_filepath)
-            os.remove(temp_filepath)
-        else:
-            logger.debug("DRY RUN Would remove temporary file : %s", temp_filepath)
+    # NOTE: temp files (partial downloads) are preserved for resumable downloads;
+    # they will be resumed on the next run via HTTP Range requests
 
     # removes empty grouping directories; ignores dotfiles such as .DS_Store
     group_name_glob = group_name_globs[grouping]
