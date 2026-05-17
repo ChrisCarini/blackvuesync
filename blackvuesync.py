@@ -1076,7 +1076,7 @@ def download_file(
 
         os.rename(temp_filepath, destination_filepath)
 
-        content_length_bytes = int(size) if size else None
+        content_length_bytes = int(transfer_size) if transfer_size else None
         speed_bps = (
             int(10.0 * float(transfer_size) / elapsed_s) if transfer_size else None
         )
