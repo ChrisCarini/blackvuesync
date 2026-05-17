@@ -570,6 +570,7 @@ cutoff_date: datetime.date | None = None  # pylint: disable=invalid-name
 
 # errno codes for unavailable dashcam
 dashcam_unavailable_errno_codes = (
+    errno.ECONNREFUSED,  # connection refused (dashcam http server not accepting)
     errno.EHOSTDOWN,  # host is down
     errno.EHOSTUNREACH,  # host is unreachable
     errno.ENETUNREACH,  # network is unreachable

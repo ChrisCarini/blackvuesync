@@ -874,6 +874,37 @@ def test_lock_closes_fd_when_lock_acquisition_fails(
     assert close_calls == [opened_fd]
 
 
+@pytest.mark.parametrize(
+    "errno_code, expected_exception",
+    [
+        # connection-level transient failures: dashcam reachable but http server
+        # not accepting (asleep, rebooting, etc.); should be UserWarning so cron
+        # mode treats them as benign
+        (errno.ECONNREFUSED, UserWarning),
+        (errno.EHOSTDOWN, UserWarning),
+        (errno.EHOSTUNREACH, UserWarning),
+        (errno.ENETUNREACH, UserWarning),
+        (errno.ETIMEDOUT, UserWarning),
+        # unmapped errno: surfaces as a hard RuntimeError
+        (errno.EACCES, RuntimeError),
+    ],
+)
+def test_get_dashcam_filenames_classifies_network_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    errno_code: int,
+    expected_exception: type[BaseException],
+) -> None:
+    """ensures connection-level errors raise UserWarning while other URLErrors raise RuntimeError"""
+
+    def fake_urlopen(_request: urllib.request.Request) -> None:
+        raise urllib.error.URLError(OSError(errno_code, os.strerror(errno_code)))
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    with pytest.raises(expected_exception):
+        blackvuesync.get_dashcam_filenames("http://192.0.2.1")
+
+
 def test_structured_log_formatter_outputs_json_with_extra_fields() -> None:
     """verifies structured logs include standard and extra fields."""
     formatter = blackvuesync.StructuredLogFormatter()
