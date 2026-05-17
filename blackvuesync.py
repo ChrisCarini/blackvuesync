@@ -1558,6 +1558,29 @@ def clean_destination(destination: str, grouping: str) -> None:
                     )
 
 
+def touch_run_marker(destination: str, marker_name: str) -> None:
+    """updates (or creates) a marker file's modification time in the destination directory"""
+    marker_filepath = os.path.join(destination, marker_name)
+    try:
+        # opens for append to create if missing without truncating
+        with open(marker_filepath, "a", encoding="utf-8"):
+            pass
+        # updates atime/mtime to now even when the file already existed
+        os.utime(marker_filepath, None)
+    except OSError as e:
+        # best-effort; never fail the run because of a marker
+        logger.debug(
+            "Could not touch run marker : %s; error : %s",
+            marker_name,
+            e,
+            extra={
+                "event": "run_marker_touch_failed",
+                "marker": marker_name,
+                "error": str(e),
+            },
+        )
+
+
 def lock(destination: str) -> int:
     """creates a lock to ensure only one instance is running on a given destination; adapted from:
     https://stackoverflow.com/questions/220525/ensure-a-single-instance-of-an-application-in-linux
@@ -1837,6 +1860,9 @@ def main() -> int:
         # prepares the local file destination
         ensure_destination(destination)
 
+        # records the start time of this run for external monitoring
+        touch_run_marker(destination, "last_run_start")
+
         lf_fd = lock(destination)
 
         try:
@@ -1892,6 +1918,11 @@ def main() -> int:
     finally:
         if lf_fd is not None:
             unlock(lf_fd)
+
+        # records the end time of this run for external monitoring; runs even
+        # on failure as long as the destination directory exists
+        if os.path.isdir(destination):
+            touch_run_marker(destination, "last_run_end")
 
         if metrics:
             with contextlib.suppress(OSError):
